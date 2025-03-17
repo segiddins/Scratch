@@ -1,11 +1,18 @@
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
+    fmt::Display,
     fs::{self, File, ReadDir},
+    iter::zip,
+    ops::Deref,
     path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, Utc};
 use duct::cmd;
+use git2::{
+    Commit, Delta, DiffOptions, ObjectType, Oid, Repository, Tree, TreeEntry, TreeWalkResult,
+};
 use indicatif::ParallelProgressIterator;
 use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
 use serde::{Deserialize, Serialize};
@@ -44,9 +51,127 @@ impl Podspec<'_> {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct IterResult {
+    commit: String,
+    podspecs: BTreeMap<String, Vec<Res>>,
+}
+
+fn iter_repo(repo: &str) -> anyhow::Result<IterResult> {
+    let repository = Repository::open(repo)?;
+
+    let mut remote = repository.find_remote("origin")?;
+    remote.fetch(&["master"], None, None)?;
+    let branch = repository.find_branch("origin/master", git2::BranchType::Remote)?;
+    let commit = branch.get().peel_to_commit()?;
+    println!("Commit: {}", commit.id());
+
+    let tree = commit.tree()?;
+    let mut podspecs: BTreeMap<String, Vec<Res>> = BTreeMap::new();
+    tree.walk(git2::TreeWalkMode::PostOrder, |s, entry| {
+        if entry.kind() != Some(git2::ObjectType::Blob) {
+            return TreeWalkResult::Ok;
+        }
+        if !entry.name_bytes().ends_with(b".podspec.json") {
+            return TreeWalkResult::Ok;
+        }
+        let binding = entry.to_object(&repository).unwrap();
+        let blob = binding.as_blob().unwrap();
+        let mut podspec: Podspec<'_> = match serde_json::from_slice(blob.content()) {
+            Ok(podspec) => podspec,
+            Err(e) => {
+                podspecs
+                    .entry(
+                        entry
+                            .name()
+                            .unwrap()
+                            .trim_end_matches(".podspec.json")
+                            .to_string(),
+                    )
+                    .or_default()
+                    .push(Res::Error {
+                        error: e.to_string(),
+                        path: format!("{}{}", s, entry.name().unwrap()),
+                    });
+                return TreeWalkResult::Ok;
+            }
+        };
+        if podspec.prepare_command.is_none() {
+            return TreeWalkResult::Ok;
+        }
+
+        podspec.loaded_from = Some(format!("{}{}", s, entry.name().unwrap()));
+        podspecs
+            .entry(podspec.name.to_string())
+            .or_default()
+            .push(Res::Podspec(podspec.into_owned()));
+
+        TreeWalkResult::Ok
+    })?;
+    Ok(IterResult {
+        commit: commit.id().to_string(),
+        podspecs,
+    })
+}
+
+fn get_dates(repo: &str) -> anyhow::Result<()> {
+    let repository = Repository::open(repo)?;
+    let branch = repository.find_branch("origin/master", git2::BranchType::Remote)?;
+    let mut commit = branch.into_reference().peel_to_commit()?;
+    let mut info: BTreeMap<String, Vec<(Delta, Oid)>> = BTreeMap::new();
+    loop {
+        if info.len() > 100 {
+            break;
+        }
+        if commit.parent_count() != 1 {
+            println!(
+                "Commit {} has {} parents",
+                commit.id(),
+                commit.parent_count()
+            );
+            break;
+        }
+        let parent = commit.parent(0)?;
+
+        let diff =
+            repository.diff_tree_to_tree(Some(&parent.tree()?), Some(&commit.tree()?), None)?;
+        for delta in diff.deltas() {
+            let old = delta.old_file();
+            let new = delta.new_file();
+            let old_path = old.path().unwrap();
+            let new_path = new.path().unwrap();
+            if old_path != new_path {
+                println!("{} -> {}", old_path.display(), new_path.display());
+            }
+
+            info.entry(new_path.display().to_string())
+                .or_default()
+                .push((delta.status(), commit.id()));
+        }
+        commit = parent;
+    }
+    println!("{:#?}", info);
+    Ok(())
+}
+
 fn main() {
     let repo = "/Users/segiddins/Development/github.com/cocoapods/Specs";
     let specs = repo.to_owned() + "/Specs";
+
+    let mut res = iter_repo(repo).unwrap();
+    res.podspecs.values_mut().for_each(|v| {
+        v.sort_by_key(|res| match res {
+            Res::Podspec(podspec) => podspec.loaded_from.to_owned().unwrap(),
+            Res::Error { error: _, path } => path.to_owned(),
+            _ => unreachable!(),
+        });
+    });
+
+    let file = File::create("podspecs_with_prepare_commands.json").unwrap();
+    serde_json::to_writer_pretty(file, &res).unwrap();
+    // get_dates(repo).unwrap();
+
+    return;
 
     let walker = Walker::new(&specs);
 
