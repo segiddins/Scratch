@@ -1,13 +1,16 @@
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
-    fmt::Display,
+    cmp::max,
+    collections::{BTreeMap, HashSet},
+    fmt::{Display, format},
     fs::{self, File, ReadDir},
     iter::zip,
     ops::Deref,
     path::{Path, PathBuf},
 };
 
+use anyhow::bail;
+use assoc::AssocExt;
 use chrono::{DateTime, Utc};
 use duct::cmd;
 use git2::{
@@ -66,6 +69,19 @@ fn iter_repo(repo: &str) -> anyhow::Result<IterResult> {
     let commit = branch.get().peel_to_commit()?;
     println!("Commit: {}", commit.id());
 
+    // {
+    //     let mut c = commit.clone();
+    //     let mut i = 10000000;
+    //     while i > 0 {
+    //         c.time().
+    //         let out = format!("{}: {:?} ({:?})", c.id(), c.time(), c.summary());
+    //         let (p, d) = thing(&repository, c)?;
+    //         println!("{}: {:?}", out, d);
+    //         c = p;
+    //         i -= 1;
+    //     }
+    // }
+
     let tree = commit.tree()?;
     let mut podspecs: BTreeMap<String, Vec<Res>> = BTreeMap::new();
     tree.walk(git2::TreeWalkMode::PostOrder, |s, entry| {
@@ -114,6 +130,109 @@ fn iter_repo(repo: &str) -> anyhow::Result<IterResult> {
     })
 }
 
+fn tree_diff<'a>(
+    repository: &'a Repository,
+    path: &str,
+    lhs: Option<Tree<'a>>,
+    rhs: Option<Tree<'a>>,
+) -> anyhow::Result<Vec<(Delta, String)>> {
+    if lhs.as_ref().map(|t| t.id()) == rhs.as_ref().map(|t| t.id()) {
+        return Ok(vec![]);
+    }
+
+    let mut lhs_entries: Vec<(String, TreeEntry)> = lhs.as_ref().map_or_else(
+        || Default::default(),
+        |t| {
+            t.iter()
+                .map(|e| (e.name().unwrap().to_string(), e))
+                .collect()
+        },
+    );
+
+    let mut rhs_entries: Vec<(String, TreeEntry)> = rhs.as_ref().map_or_else(
+        || Default::default(),
+        |t| {
+            t.iter()
+                .map(|e| (e.name().unwrap().to_string(), e))
+                .collect()
+        },
+    );
+
+    lhs_entries.sort_by(|(l, _), (r, _)| l.cmp(r));
+    rhs_entries.sort_by(|(l, _), (r, _)| l.cmp(r));
+
+    let mut all_keys = lhs_entries
+        .iter()
+        .map(|(k, _)| k)
+        .chain(rhs_entries.iter().map(|(k, _)| k))
+        .collect::<HashSet<_>>();
+
+    let mut res: Vec<(Delta, String)> = vec![];
+
+    for name in all_keys {
+        let l = lhs_entries.get(name);
+        let r = rhs_entries.get(name);
+
+        if l.as_ref().map(|(e)| e.id()) == r.as_ref().map(|(e)| e.id()) {
+            continue;
+        }
+
+        let l_kind = l.as_ref().map(|(e)| e.kind()).flatten();
+        let r_kind = r.as_ref().map(|(e)| e.kind()).flatten();
+
+        let child_path = format!("{}/{}", path, name);
+
+        match (l_kind, r_kind) {
+            (Some(ObjectType::Blob), Some(ObjectType::Blob)) => {
+                res.push((Delta::Modified, child_path));
+            }
+            (None, Some(ObjectType::Blob)) => {
+                res.push((Delta::Added, child_path));
+            }
+            (Some(ObjectType::Blob), None) => {
+                res.push((Delta::Deleted, child_path));
+            }
+            (None, Some(ObjectType::Tree)) | (Some(ObjectType::Tree), _) => {
+                let mut diff = tree_diff(
+                    repository,
+                    child_path.as_str(),
+                    l.map(|l| l.to_object(repository).unwrap().into_tree().unwrap()),
+                    r.map(|l| l.to_object(repository).unwrap().into_tree().unwrap()),
+                )?;
+                res.append(&mut diff);
+            }
+            (None, None) => unreachable!(),
+            (l, r) => {
+                bail!("unimplemented for {}: {:?}, {:?}", child_path, l, r);
+            }
+        }
+    }
+
+    return Ok(res);
+}
+
+fn thing<'a>(
+    repository: &'a Repository,
+    commit: Commit<'a>,
+) -> anyhow::Result<(Commit<'a>, Vec<(Delta, String)>)> {
+    if commit.parent_count() != 1 {
+        bail!(
+            "Commit {} has {} parents",
+            commit.id(),
+            commit.parent_count()
+        );
+    }
+    let parent = commit.parent(0)?;
+    let tree = commit.tree()?;
+
+    let parent_tree = parent.tree()?;
+
+    Ok((
+        parent,
+        tree_diff(repository, ".", Some(parent_tree), Some(tree))?,
+    ))
+}
+
 fn get_dates(repo: &str) -> anyhow::Result<()> {
     let repository = Repository::open(repo)?;
     let branch = repository.find_branch("origin/master", git2::BranchType::Remote)?;
@@ -156,7 +275,6 @@ fn get_dates(repo: &str) -> anyhow::Result<()> {
 
 fn main() {
     let repo = "/Users/segiddins/Development/github.com/cocoapods/Specs";
-    let specs = repo.to_owned() + "/Specs";
 
     let mut res = iter_repo(repo).unwrap();
     res.podspecs.values_mut().for_each(|v| {
