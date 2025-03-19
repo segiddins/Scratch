@@ -1,23 +1,16 @@
 use std::{
     borrow::Cow,
-    cmp::max,
     collections::{BTreeMap, HashSet},
-    fmt::{Display, format},
-    fs::{self, File, ReadDir},
-    iter::zip,
-    ops::Deref,
-    path::{Path, PathBuf},
+    fs::File,
 };
 
 use anyhow::bail;
 use assoc::AssocExt;
 use chrono::{DateTime, Utc};
 use duct::cmd;
-use git2::{
-    Commit, Delta, DiffOptions, ObjectType, Oid, Repository, Tree, TreeEntry, TreeWalkResult,
-};
+use git2::{Commit, Delta, ObjectType, Oid, Repository, Tree, TreeEntry, TreeWalkResult};
 use indicatif::ParallelProgressIterator;
-use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -64,21 +57,20 @@ fn iter_repo(repo: &str) -> anyhow::Result<IterResult> {
     let repository = Repository::open(repo)?;
 
     let mut remote = repository.find_remote("origin")?;
+    println!("Fetching...");
     remote.fetch(&["master"], None, None)?;
     let branch = repository.find_branch("origin/master", git2::BranchType::Remote)?;
     let commit = branch.get().peel_to_commit()?;
     println!("Commit: {}", commit.id());
 
     // {
+    //     println!("Finding dates...");
     //     let mut c = commit.clone();
-    //     let mut i = 10000000;
-    //     while i > 0 {
-    //         c.time().
+    //     loop {
     //         let out = format!("{}: {:?} ({:?})", c.id(), c.time(), c.summary());
     //         let (p, d) = thing(&repository, c)?;
-    //         println!("{}: {:?}", out, d);
+    //         // println!("{}: {:?}", out, d);
     //         c = p;
-    //         i -= 1;
     //     }
     // }
 
@@ -217,9 +209,10 @@ fn thing<'a>(
 ) -> anyhow::Result<(Commit<'a>, Vec<(Delta, String)>)> {
     if commit.parent_count() != 1 {
         bail!(
-            "Commit {} has {} parents",
+            "Commit {} has {} parents\n{}",
             commit.id(),
-            commit.parent_count()
+            commit.parent_count(),
+            commit.body().unwrap_or_default()
         );
     }
     let parent = commit.parent(0)?;
@@ -232,6 +225,33 @@ fn thing<'a>(
         tree_diff(repository, ".", Some(parent_tree), Some(tree))?,
     ))
 }
+
+#[derive(Debug, Deserialize)]
+struct CocoaPodsVersion {
+    min: String,
+    max: String,
+    prefix_lengths: Vec<usize>,
+}
+
+// fn specs_par_iter<'a>(repo: &'a Repository, tree: Tree<'a>) -> () {
+//     let cocoapods_version: TreeEntry<'_> = tree.get_name("CocoaPods-version.yml").unwrap();
+//     let cocoapods_version = cocoapods_version
+//         .to_object(repo)
+//         .unwrap()
+//         .into_blob()
+//         .unwrap();
+//     let cocoapods_version: CocoaPodsVersion =
+//         serde_yaml::from_slice(cocoapods_version.content()).unwrap();
+
+//     let specs = tree.get_name("Specs").unwrap();
+//     let specs = specs.to_object(repo).unwrap().into_tree().unwrap();
+
+//     let trees: Vec<Tree<'a>> = vec![];
+
+//     specs.iter().par_bridge()
+
+//     todo!()
+// }
 
 fn get_dates(repo: &str) -> anyhow::Result<()> {
     let repository = Repository::open(repo)?;
@@ -288,100 +308,4 @@ fn main() {
     let file = File::create("podspecs_with_prepare_commands.json").unwrap();
     serde_json::to_writer_pretty(file, &res).unwrap();
     // get_dates(repo).unwrap();
-
-    return;
-
-    let walker = Walker::new(&specs);
-
-    let mut specs: Vec<Res> = walker
-        .par_bridge()
-        .into_par_iter()
-        .progress_count(800000)
-        .filter(|path| path.to_string_lossy().ends_with(".podspec.json"))
-        .map(|path| {
-            let contents = fs::read(&path).unwrap();
-            let mut podspec: Podspec = match serde_json::from_slice(&contents) {
-                Ok(podspec) => podspec,
-                Err(e) => {
-                    return Res::Error {
-                        error: e.to_string(),
-                        path: path.strip_prefix(repo).unwrap().display().to_string(),
-                    };
-                }
-            };
-
-            if podspec.prepare_command.is_none() {
-                return Res::NoPrepareCommand;
-            }
-
-            podspec.loaded_from = Some(path.strip_prefix(repo).unwrap().display().to_string());
-
-            // podspec.published = cmd!("git", "-C", repo, "log", "-1", "--format=%cI", "--", path)
-            //     .read()
-            //     .unwrap()
-            //     .parse()
-            //     .unwrap();
-
-            Res::Podspec(podspec.into_owned())
-        })
-        .filter(|res| match res {
-            Res::NoPrepareCommand => false,
-            _ => true,
-        })
-        .collect();
-
-    specs.sort_by_key(|res| match res {
-        Res::Podspec(podspec) => podspec.loaded_from.to_owned().unwrap(),
-        Res::Error { error: _, path } => path.to_owned(),
-        _ => unreachable!(),
-    });
-
-    let file = File::create("podspecs_with_prepare_commands.json").unwrap();
-    serde_json::to_writer_pretty(file, &specs).unwrap();
-}
-
-struct Walker {
-    stack: Vec<ReadDir>,
-    current: Option<<Vec<PathBuf> as IntoIterator>::IntoIter>,
-}
-
-impl Walker {
-    fn new(root: impl AsRef<Path>) -> Self {
-        let stack = vec![fs::read_dir(root).unwrap()];
-        Self {
-            stack,
-            current: None,
-        }
-    }
-}
-
-impl Iterator for Walker {
-    type Item = PathBuf;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(ref mut current) = self.current {
-                if let Some(path) = current.next() {
-                    return Some(path);
-                }
-                self.current = None;
-            }
-
-            if let Some(dir) = self.stack.pop() {
-                let mut paths = vec![];
-                for entry in dir {
-                    let entry = entry.unwrap();
-                    let path = entry.path();
-                    if path.is_dir() {
-                        self.stack.push(fs::read_dir(&path).unwrap());
-                    } else {
-                        paths.push(path);
-                    }
-                }
-                self.current = Some(paths.into_iter());
-            } else {
-                return None;
-            }
-        }
-    }
 }
