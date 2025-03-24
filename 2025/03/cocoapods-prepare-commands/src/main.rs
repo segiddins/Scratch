@@ -1,16 +1,16 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet},
-    fs::File,
+    fs::{self, File},
+    ops::Range,
+    path::{self, Path, PathBuf},
 };
 
 use anyhow::bail;
 use assoc::AssocExt;
 use chrono::{DateTime, Utc};
-use duct::cmd;
-use git2::{Commit, Delta, ObjectType, Oid, Repository, Tree, TreeEntry, TreeWalkResult};
-use indicatif::ParallelProgressIterator;
-use rayon::prelude::*;
+use git2::{Commit, Delta, ObjectType, Oid, Repository, Tree, TreeEntry, TreeIter, TreeWalkResult};
+use rayon::{iter::IterBridge, prelude::*};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -63,16 +63,17 @@ fn iter_repo(repo: &str) -> anyhow::Result<IterResult> {
     let commit = branch.get().peel_to_commit()?;
     println!("Commit: {}", commit.id());
 
-    // {
-    //     println!("Finding dates...");
-    //     let mut c = commit.clone();
-    //     loop {
-    //         let out = format!("{}: {:?} ({:?})", c.id(), c.time(), c.summary());
-    //         let (p, d) = thing(&repository, c)?;
-    //         // println!("{}: {:?}", out, d);
-    //         c = p;
-    //     }
-    // }
+    {
+        println!("Finding dates...");
+        let mut c = commit.clone();
+        loop {
+            // let out = format!("{}: {:?} ({:?})", c.id(), c.time(), c.summary());
+            let (p, d) = thing(&repository, &c)?;
+            // println!("{}: {:?}", out, d);
+            c = p;
+            break;
+        }
+    }
 
     let tree = commit.tree()?;
     let mut podspecs: BTreeMap<String, Vec<Res>> = BTreeMap::new();
@@ -132,28 +133,24 @@ fn tree_diff<'a>(
         return Ok(vec![]);
     }
 
-    let mut lhs_entries: Vec<(String, TreeEntry)> = lhs.as_ref().map_or_else(
-        || Default::default(),
-        |t| {
+    let mut lhs_entries: Vec<(String, TreeEntry)> =
+        lhs.as_ref().map_or_else(Default::default, |t| {
             t.iter()
                 .map(|e| (e.name().unwrap().to_string(), e))
                 .collect()
-        },
-    );
+        });
 
-    let mut rhs_entries: Vec<(String, TreeEntry)> = rhs.as_ref().map_or_else(
-        || Default::default(),
-        |t| {
+    let mut rhs_entries: Vec<(String, TreeEntry)> =
+        rhs.as_ref().map_or_else(Default::default, |t| {
             t.iter()
                 .map(|e| (e.name().unwrap().to_string(), e))
                 .collect()
-        },
-    );
+        });
 
     lhs_entries.sort_by(|(l, _), (r, _)| l.cmp(r));
     rhs_entries.sort_by(|(l, _), (r, _)| l.cmp(r));
 
-    let mut all_keys = lhs_entries
+    let all_keys = lhs_entries
         .iter()
         .map(|(k, _)| k)
         .chain(rhs_entries.iter().map(|(k, _)| k))
@@ -165,12 +162,12 @@ fn tree_diff<'a>(
         let l = lhs_entries.get(name);
         let r = rhs_entries.get(name);
 
-        if l.as_ref().map(|(e)| e.id()) == r.as_ref().map(|(e)| e.id()) {
+        if l.as_ref().map(|e| e.id()) == r.as_ref().map(|e| e.id()) {
             continue;
         }
 
-        let l_kind = l.as_ref().map(|(e)| e.kind()).flatten();
-        let r_kind = r.as_ref().map(|(e)| e.kind()).flatten();
+        let l_kind = l.as_ref().and_then(|e| e.kind());
+        let r_kind = r.as_ref().and_then(|e| e.kind());
 
         let child_path = format!("{}/{}", path, name);
 
@@ -200,12 +197,12 @@ fn tree_diff<'a>(
         }
     }
 
-    return Ok(res);
+    Ok(res)
 }
 
 fn thing<'a>(
     repository: &'a Repository,
-    commit: Commit<'a>,
+    commit: &Commit<'a>,
 ) -> anyhow::Result<(Commit<'a>, Vec<(Delta, String)>)> {
     if commit.parent_count() != 1 {
         bail!(
@@ -253,23 +250,18 @@ struct CocoaPodsVersion {
 //     todo!()
 // }
 
-fn get_dates(repo: &str) -> anyhow::Result<()> {
+fn get_dates(repo: &str) -> anyhow::Result<BTreeMap<String, Vec<(Delta, Oid)>>> {
     let repository = Repository::open(repo)?;
     let branch = repository.find_branch("origin/master", git2::BranchType::Remote)?;
     let mut commit = branch.into_reference().peel_to_commit()?;
     let mut info: BTreeMap<String, Vec<(Delta, Oid)>> = BTreeMap::new();
     loop {
-        if info.len() > 100 {
-            break;
+        match commit.parent_count() {
+            0 => break,
+            1 => {}
+            n => bail!("Commit {} has {} parents", commit.id(), n),
         }
-        if commit.parent_count() != 1 {
-            println!(
-                "Commit {} has {} parents",
-                commit.id(),
-                commit.parent_count()
-            );
-            break;
-        }
+
         let parent = commit.parent(0)?;
 
         let diff =
@@ -289,12 +281,94 @@ fn get_dates(repo: &str) -> anyhow::Result<()> {
         }
         commit = parent;
     }
-    println!("{:#?}", info);
-    Ok(())
+    Ok(info)
+}
+
+struct PodspecIterMap<'repo, T> {
+    repository: &'repo Repository,
+    iter: Option<(Tree<'repo>, PathBuf, Range<usize>)>,
+    stack: Vec<(Tree<'repo>, PathBuf)>,
+    func: Box<dyn Fn(&'repo Repository, &Path, TreeEntry) -> T + 'static>,
+}
+
+impl<'repo, T> PodspecIterMap<'repo, T> {
+    fn new<F>(repository: &'repo Repository, func: F) -> Result<Self, git2::Error>
+    where
+        F: Fn(&'repo Repository, &Path, TreeEntry) -> T + 'static,
+    {
+        let branch = repository.find_branch("origin/master", git2::BranchType::Remote)?;
+        let commit = branch.get().peel_to_commit()?;
+        let tree = commit.tree()?;
+        let range = 0..tree.len();
+
+        Ok(Self {
+            repository,
+            iter: Some((tree, "".into(), range)),
+            stack: vec![],
+            func: Box::new(func),
+        })
+    }
+}
+
+impl<T> Iterator for PodspecIterMap<'_, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((tree, dir, range)) = self.iter.as_mut() {
+                if let Some(entry) = (*range).next().map(|i| tree.get(i).unwrap()) {
+                    let dir = dir.join(entry.name().unwrap());
+                    match entry.kind() {
+                        Some(ObjectType::Tree) => {
+                            let tree = entry
+                                .to_object(self.repository)
+                                .unwrap()
+                                .into_tree()
+                                .unwrap();
+                            self.stack.push((tree, dir));
+                            continue;
+                        }
+                        Some(ObjectType::Blob)
+                            if entry.name().unwrap().ends_with(".podspec.json") =>
+                        {
+                            return Some((self.func)(self.repository, &dir, entry));
+                        }
+                        _ => {
+                            continue;
+                        }
+                    }
+                }
+            }
+            let (tree, dir) = self.stack.pop()?;
+            let range = 0..tree.len();
+            self.iter = Some((tree, dir, range));
+        }
+    }
 }
 
 fn main() {
     let repo = "/Users/segiddins/Development/github.com/cocoapods/Specs";
+
+    let repository = Repository::open(repo).unwrap();
+    let iter = PodspecIterMap::new(&repository, |repo, path, entry| {
+        let binding = entry.to_object(repo).unwrap();
+        let blob = binding.into_blob().unwrap();
+        let podspec: Res = serde_json::from_slice(blob.content())
+            .map(|podspec: Podspec| {
+                if podspec.prepare_command.is_some() {
+                    Res::Podspec(podspec.into_owned())
+                } else {
+                    Res::NoPrepareCommand
+                }
+            })
+            .unwrap_or_else(|e| Res::Error {
+                error: e.to_string(),
+                path: path.display().to_string(),
+            });
+        podspec
+    })
+    .unwrap();
+    // println!("{:#?}", iter.collect::<Vec<_>>().len());
 
     let mut res = iter_repo(repo).unwrap();
     res.podspecs.values_mut().for_each(|v| {
@@ -307,5 +381,4 @@ fn main() {
 
     let file = File::create("podspecs_with_prepare_commands.json").unwrap();
     serde_json::to_writer_pretty(file, &res).unwrap();
-    // get_dates(repo).unwrap();
 }
