@@ -1,6 +1,7 @@
+use core::time;
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
     ops::Range,
     path::{self, Path, PathBuf},
@@ -8,8 +9,8 @@ use std::{
 
 use anyhow::bail;
 use assoc::AssocExt;
-use chrono::{DateTime, Utc};
-use git2::{Commit, Delta, ObjectType, Oid, Repository, Tree, TreeEntry, TreeIter, TreeWalkResult};
+use chrono::{DateTime, FixedOffset, TimeZone, Utc};
+use git2::{Commit, Delta, ObjectType, Oid, Repository, Tree, TreeEntry, TreeWalkResult};
 use rayon::{iter::IterBridge, prelude::*};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,9 @@ struct Podspec<'a> {
 
     #[serde(skip_deserializing)]
     loaded_from: Option<String>,
+
+    #[serde(skip_deserializing)]
+    commits: Vec<(String, String, String)>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,6 +47,7 @@ impl Podspec<'_> {
             prepare_command: self.prepare_command.map(|s| s.into_owned().into()),
             published: self.published,
             loaded_from: self.loaded_from,
+            commits: self.commits,
         }
     }
 }
@@ -63,17 +68,29 @@ fn iter_repo(repo: &str) -> anyhow::Result<IterResult> {
     let commit = branch.get().peel_to_commit()?;
     println!("Commit: {}", commit.id());
 
-    {
+    let commits_by_path = {
         println!("Finding dates...");
+        let mut commits: HashMap<String, Vec<_>> = HashMap::new();
         let mut c = commit.clone();
         loop {
+            let id = c.id();
+            let date = c.time();
+            let date = FixedOffset::east_opt(date.offset_minutes() * 60)
+                .unwrap()
+                .timestamp_opt(date.seconds(), 0)
+                .unwrap();
             // let out = format!("{}: {:?} ({:?})", c.id(), c.time(), c.summary());
-            let (p, d) = thing(&repository, &c)?;
-            // println!("{}: {:?}", out, d);
+            let Ok((p, d)) = thing(&repository, &c) else {
+                println!("Error: {}", c.id());
+                break;
+            };
+            for (delta, path) in d {
+                commits.entry(path).or_default().push((delta, date, c.id()));
+            }
             c = p;
-            break;
         }
-    }
+        commits
+    };
 
     let tree = commit.tree()?;
     let mut podspecs: BTreeMap<String, Vec<Res>> = BTreeMap::new();
@@ -110,6 +127,15 @@ fn iter_repo(repo: &str) -> anyhow::Result<IterResult> {
         }
 
         podspec.loaded_from = Some(format!("{}{}", s, entry.name().unwrap()));
+
+        podspec.commits = commits_by_path
+            .get(&format!("./{}", podspec.loaded_from.as_ref().unwrap()))
+            .map(|v| {
+                v.iter()
+                    .map(|(d, t, c)| (format!("{:?}", d), t.to_rfc3339(), c.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
         podspecs
             .entry(podspec.name.to_string())
             .or_default()
