@@ -1,0 +1,23 @@
+[package]
+name = "gemspec-rs"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+anyhow = "1.0.97"
+chrono = { version = "0.4.40", features = ["serde"] }
+flate2 = "1.1.0"
+miette = "7.5.0"
+rayon = "1.10.0"
+saphyr = "0.0.4"
+saphyr-parser = "0.0.4"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+serde_with = { version = "3.12.0", features = ["hex"] }
+serde_yaml = "0.9.34"
+sha2 = "0.10.8"
+strum = "0.27.1"
+strum_macros = "0.27.1"
+tar = "0.4.44"
+tree_magic_mini = "3.1.6"
